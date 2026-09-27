@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+catboost_info/
 .venv/
 venv/
 
@@ -30,3 +31,4 @@ FINAL_DATASET/ACES/*
 
 .vercel
 .env*
+models/cmapss_rul_method.joblib

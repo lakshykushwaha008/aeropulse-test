@@ -45,6 +45,21 @@ def _dynamic_step(base: dict, index: int, steps: int) -> dict:
         1.0 + 0.008 * math.sin(phase * 1.5)
     )
 
+    if "Oil_Pressure" in data and isinstance(data["Oil_Pressure"], (int, float)):
+        data["Oil_Pressure"] = float(data["Oil_Pressure"]) * (
+            1.0 + 0.005 * math.sin(phase * 1.8 + 0.2)
+        )
+
+    if "Battery_Voltage" in data and isinstance(data["Battery_Voltage"], (int, float)):
+        data["Battery_Voltage"] = float(data["Battery_Voltage"]) * (
+            1.0 + 0.002 * math.sin(phase * 0.7 + 0.1)
+        )
+
+    if "Battery_Current" in data and isinstance(data["Battery_Current"], (int, float)):
+        data["Battery_Current"] = float(data["Battery_Current"]) * (
+            1.0 + 0.008 * math.sin(phase * 1.2 + 0.5)
+        )
+
     return data
 
 
@@ -218,6 +233,11 @@ def run_replay(
         )
     )
 
+    eid = scenario.get("engine_id", "Rotax-914-Turbo-115HP")
+    _RUL.reset(eid)
+    if hasattr(ai, "reset"):
+        ai.reset(eid)
+
     timeline = []
 
     health_history = []
@@ -244,16 +264,20 @@ def run_replay(
         )
 
         ratio = i / max(1, steps - 1)
-        uav_pos = gps.get_position(ratio)
+        is_waypoint_driven = bool(scenario.get("waypoints") or scenario.get("preset"))
+        override_alt = float(scenario.get("altitude_ft", 3000)) if (scenario.get("simulation_mode") == "manual_override" or not is_waypoint_driven) else None
 
-        if scenario.get("simulation_mode") != "manual_override":
+        pos_ctx = {"manual_altitude_override": True, "altitude_ft": override_alt} if override_alt is not None else None
+        uav_pos = gps.get_position(ratio, mission_context=pos_ctx)
+
+        if override_alt is not None:
+            step_alt = override_alt
+            step_amb = float(scenario.get("ambient_c", 25))
+            step_dur = float(scenario.get("duration_h", 4))
+        else:
             step_alt = uav_pos.altitude_ft
             step_amb = uav_pos.ambient_c
             step_dur = max(0.5, gps.total_duration_min / 60.0)
-        else:
-            step_alt = float(scenario.get("altitude_ft", 3000))
-            step_amb = float(scenario.get("ambient_c", 25))
-            step_dur = float(scenario.get("duration_h", 4))
 
         point = mission_adjust(
             point,
@@ -311,14 +335,19 @@ def run_replay(
                 fault_severity,
             )
 
+        step_context = dict(scenario)
+        step_context["altitude_ft"] = step_alt
+        step_context["ambient_c"] = step_amb
+        step_context["duration_h"] = step_dur
+
         analysis = ai.analyze(
             point,
-            context=scenario,
+            context=step_context,
         )
 
         risk = mission_risk(
             analysis,
-            scenario,
+            step_context,
         )
 
         anomaly_flag = bool(
@@ -391,6 +420,10 @@ def run_replay(
         # (RC-1 fix: service no longer reads Degradation_Severity)
         point["health_index"] = replay_health
 
+        sh = analysis.get("sensor_health", {})
+        sensor_fault_flag = bool(sh.get("is_sensor_fault_only") or sh.get("verdict") == "SENSOR_FAULT_ISOLATED")
+        sensor_sev = max(0.0, (100.0 - float(sh.get("overall_trust_score", 100.0))) / 100.0) if sensor_fault_flag else 0.0
+
         fallback = _RUL.predict(
             point,
             context={
@@ -400,6 +433,8 @@ def run_replay(
                 "mission_hours": float(scenario.get("duration_h", 4)),
                 "ambient_c": float(scenario.get("ambient_c", 25)),
                 "altitude_ft": float(scenario.get("altitude_ft", 3000)),
+                "sensor_fault_flag": sensor_fault_flag,
+                "sensor_fault_severity": sensor_sev,
             },
         )
 
@@ -487,6 +522,12 @@ def run_replay(
                         "overall_trust_score"
                     ],
 
+                "fault_candidates": analysis.get("fault_candidates", []),
+                "sensor_health": analysis.get("sensor_health", {}),
+                "twin": analysis.get("twin", {}),
+                "mission_risk": risk,
+                "maintenance_advisory": analysis.get("maintenance_advisory", ""),
+
                 "rul": rul,
 
                 "rul_hours":
@@ -562,6 +603,9 @@ def run_replay(
         health_history,
         step_minutes,
     )
+
+    if hasattr(ai, "reset"):
+        ai.reset(scenario.get("engine_id"))
 
     return {
         "timeline": timeline,

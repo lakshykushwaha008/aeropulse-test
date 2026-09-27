@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 
 from typing import Any, Dict, List, Optional
 
@@ -380,6 +381,7 @@ def _build_live_engine_data(
     )
 
     phase = str(getattr(mission_point, "mission_phase", "CRUISE")).upper()
+    op_state = str(getattr(mission_point, "operating_state", "CRUISE")).upper()
 
     if phase in ["GROUND", "PREFLIGHT", "OFF", "STATIONARY"]:
         run_state = "ENGINE_OFF"
@@ -392,9 +394,15 @@ def _build_live_engine_data(
         rpm = 400.0
     else:
         run_state = "ENGINE_RUNNING"
-        rpm = 3000.0 * (
-            0.92 + 0.12 * throttle
-        )
+        if phase in ["TAKEOFF", "CLIMB", "HIGH_ALTITUDE"] or op_state == "HIGH":
+            rpm = 5350.0 + 150.0 * (throttle - 0.70) / 0.30
+        elif phase in ["ENDURANCE"] or op_state == "CRUISE_LOW":
+            rpm = 3180.0 + 200.0 * (throttle - 0.50) / 0.20
+        elif phase in ["DESCENT", "APPROACH", "LANDING"]:
+            rpm = 2800.0 + 300.0 * (throttle - 0.30) / 0.30
+        else:
+            rpm = 4600.0 + 100.0 * (throttle - 0.60) / 0.20
+        rpm = max(1400.0, min(5800.0, float(rpm)))
 
     if run_state == "ENGINE_OFF":
         data = _ENGINE.simulate(
@@ -1806,6 +1814,16 @@ async def telemetry_stream(
                     fault_severity,
                     4,
                 ),
+
+                "twin": analysis.get("twin", {}),
+
+                "fault_candidates": analysis.get("fault_candidates", []),
+
+                "sensor_health": analysis.get("sensor_health", {}),
+
+                "maintenance_advisory": analysis.get("maintenance_advisory", ""),
+
+                "mission_risk": risk,
 
                 "telemetry_version": (
                     telemetry_packet.telemetry_version

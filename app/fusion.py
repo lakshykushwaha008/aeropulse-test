@@ -55,11 +55,37 @@ class FusionEngine:
         if not tcn_probs:
             tcn_probs = dict(hgb_probs)
 
+        bulk_rms = float(sensor_health.get("bulk_physics_rms_z", rms_z))
+        is_isolated = bool(
+            sensor_health.get("is_sensor_fault_only")
+            or sensor_health.get("verdict") == "SENSOR_FAULT_ISOLATED"
+            or (trust < 40.0 and len(suspects) <= 2 and bulk_rms < 2.0)
+        )
+
         # 1. Deterministic Sensor fault isolation veto (Safety Rule 1)
-        if trust < 40.0 and len(suspects) <= 2 and rms_z < 2.0:
+        if is_isolated and bulk_rms < 2.0:
             final_diag = "Watch"
             conf = 0.85
             reasons.append(f"ISOLATED_SENSOR_FAULT: {', '.join(suspects)} untrusted while engine bulk physics normal.")
+            return DiagnosticEvidence(
+                hgb_probs=hgb_probs,
+                tcn_probs=tcn_probs,
+                anomaly_reconstruction_loss=anomaly_loss,
+                is_unknown_anomaly=is_unknown_anomaly,
+                physics_max_abs_z=max_z,
+                physics_residual_rms=bulk_rms,
+                sensor_trust_score=trust,
+                suspect_sensors=suspects,
+                final_diagnosis=final_diag,
+                confidence_score=conf,
+                reason_codes=reasons,
+            )
+
+        # 2. Unknown Multi-Sensor Anomaly veto (Safety Rule 2)
+        if is_unknown_anomaly and max_z > 2.5 and not is_isolated:
+            final_diag = "Critical"
+            conf = 0.90
+            reasons.append("UNKNOWN_ANOMALY_INVESTIGATE: Multi-sensor sequence reconstruction loss exceeded statistical threshold.")
             return DiagnosticEvidence(
                 hgb_probs=hgb_probs,
                 tcn_probs=tcn_probs,
@@ -74,18 +100,20 @@ class FusionEngine:
                 reason_codes=reasons,
             )
 
-        # 2. Unknown Multi-Sensor Anomaly veto (Safety Rule 2)
-        if is_unknown_anomaly and max_z > 2.5:
-            final_diag = "Critical"
-            conf = 0.90
-            reasons.append("UNKNOWN_ANOMALY_INVESTIGATE: Multi-sensor sequence reconstruction loss exceeded statistical threshold.")
+        # 3. First-Principles Digital Twin Concordance Rule (Safety Rule 3)
+        # If bulk physics residuals strictly align with healthy engine model (RMS < 1.2, max z < 2.5)
+        # and all sensors are verified trustworthy (>= 90%), enforce Nominal health state.
+        if bulk_rms < 1.2 and max_z < 2.5 and trust >= 90.0:
+            final_diag = "Normal"
+            conf = max(0.92, float(hgb_probs.get("Normal", 0.92) * 0.70 + tcn_probs.get("Normal", 0.92) * 0.30))
+            reasons.append("NOMINAL_CONCORDANCE: Telemetry strictly aligned with first-principles digital twin (RMS < 1.2).")
             return DiagnosticEvidence(
                 hgb_probs=hgb_probs,
                 tcn_probs=tcn_probs,
                 anomaly_reconstruction_loss=anomaly_loss,
                 is_unknown_anomaly=is_unknown_anomaly,
                 physics_max_abs_z=max_z,
-                physics_residual_rms=rms_z,
+                physics_residual_rms=bulk_rms,
                 sensor_trust_score=trust,
                 suspect_sensors=suspects,
                 final_diagnosis=final_diag,
