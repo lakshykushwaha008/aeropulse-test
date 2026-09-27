@@ -100,6 +100,27 @@ class FusionEngine:
                 reason_codes=reasons,
             )
 
+        # 3. First-Principles Digital Twin Concordance Rule (Safety Rule 3)
+        # If bulk physics residuals strictly align with healthy engine model (RMS < 1.2, max z < 2.5)
+        # and all sensors are verified trustworthy (>= 90%), enforce Nominal health state.
+        if bulk_rms < 1.2 and max_z < 2.5 and trust >= 90.0:
+            final_diag = "Normal"
+            conf = max(0.92, float(hgb_probs.get("Normal", 0.92) * 0.70 + tcn_probs.get("Normal", 0.92) * 0.30))
+            reasons.append("NOMINAL_CONCORDANCE: Telemetry strictly aligned with first-principles digital twin (RMS < 1.2).")
+            return DiagnosticEvidence(
+                hgb_probs=hgb_probs,
+                tcn_probs=tcn_probs,
+                anomaly_reconstruction_loss=anomaly_loss,
+                is_unknown_anomaly=is_unknown_anomaly,
+                physics_max_abs_z=max_z,
+                physics_residual_rms=bulk_rms,
+                sensor_trust_score=trust,
+                suspect_sensors=suspects,
+                final_diagnosis=final_diag,
+                confidence_score=conf,
+                reason_codes=reasons,
+            )
+
         # 3. Optimized Zero-Leakage Hybrid Probability Weighting (0.70 HGB + 0.30 TCN)
         classes = ["Critical", "Warning", "Watch", "Normal"]
         fused_p = {}

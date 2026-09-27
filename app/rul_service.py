@@ -155,27 +155,32 @@ class RULService:
         stress = self.calculate_mission_stress(context)
 
         # Elapsed operating time in hours
-        try:
-            elapsed_hours = float(context.get("elapsed_hours", context.get("flight_hours", 0.0)))
-            if not math.isfinite(elapsed_hours) or elapsed_hours < 0:
+        if "elapsed_hours" in context:
+            try:
+                val = float(context["elapsed_hours"])
+                elapsed_hours = max(0.0, val) if math.isfinite(val) else 0.0
+            except (TypeError, ValueError):
                 elapsed_hours = 0.0
-        except (TypeError, ValueError):
+        elif "flight_hours" in context:
+            try:
+                val = float(context["flight_hours"])
+                elapsed_hours = max(0.0, val) if math.isfinite(val) else 0.0
+            except (TypeError, ValueError):
+                elapsed_hours = 0.0
+        elif "mission_time_min" in context:
+            try:
+                val = float(context["mission_time_min"])
+                elapsed_hours = max(0.0, val / 60.0) if math.isfinite(val) else 0.0
+            except (TypeError, ValueError):
+                elapsed_hours = 0.0
+        elif "timestamp" in context:
+            try:
+                val = float(context["timestamp"])
+                elapsed_hours = max(0.0, val / 3600.0) if math.isfinite(val) else 0.0
+            except (TypeError, ValueError):
+                elapsed_hours = 0.0
+        else:
             elapsed_hours = 0.0
-        if elapsed_hours == 0.0 and "mission_time_min" in context:
-            try:
-                elapsed_hours = max(0.0, float(context["mission_time_min"]) / 60.0)
-            except (TypeError, ValueError):
-                elapsed_hours = 0.0
-        elif elapsed_hours == 0.0 and "mission_hours" in context:
-            try:
-                elapsed_hours = max(0.0, float(context["mission_hours"]))
-            except (TypeError, ValueError):
-                elapsed_hours = 0.0
-        elif elapsed_hours == 0.0 and "timestamp" in context:
-            try:
-                elapsed_hours = max(0.0, float(context["timestamp"]) / 3600.0)
-            except (TypeError, ValueError):
-                elapsed_hours = 0.0
 
         # Mission / Profile Horizon Ceiling if specified
         # TBO is a maintenance ceiling/horizon, not an inherent physical failure time.
@@ -193,9 +198,14 @@ class RULService:
         dt = elapsed_hours - prev_t if state is not None else elapsed_hours
 
         # 1. Trajectory Trend Extrapolation
+        is_sensor_fault = bool(
+            context.get("sensor_fault_flag")
+            or context.get("is_sensor_fault_only")
+            or (float(context.get("sensor_fault_severity", 0.0)) > 0.3)
+        )
         effective_history = health_history or (state.health_history if state else None)
         trend_res = None
-        if effective_history and len(effective_history) >= 6:
+        if not is_sensor_fault and effective_history and len(effective_history) >= 6:
             trend_res = estimate_degradation_horizon(
                 effective_history,
                 step_minutes=step_minutes,
@@ -229,13 +239,19 @@ class RULService:
             candidate_status = "WARNING_ELEVATED_WEAR"
             deg_rate = round(nominal_deg_rate, 4)
             method = "Physics-Stress Weighted Trend Extrapolation"
+        elif current_health < 85.0:
+            health_fraction = (current_health - self.WARNING_HEALTH_THRESHOLD) / (85.0 - self.WARNING_HEALTH_THRESHOLD)
+            watch_scale = 0.85 + 0.15 * max(0.0, min(1.0, health_fraction))
+            candidate_rul = max(0.0, min(max_achievable_life, max_achievable_life * watch_scale))
+            confidence = 0.75
+            spread = 0.25
+            candidate_status = "WATCH_ELEVATED_STRESS"
+            deg_rate = round(((100.0 - self.CRITICAL_HEALTH_THRESHOLD) / tbo_hours) * stress * 1.25, 4)
+            method = "Physics-Stress Weighted Trend Extrapolation"
         else:
-            remaining_points = current_health - self.CRITICAL_HEALTH_THRESHOLD
-            health_fraction = remaining_points / (100.0 - self.CRITICAL_HEALTH_THRESHOLD)
-            health_rul = max_achievable_life * health_fraction
-            candidate_rul = max(0.0, min(max_achievable_life, health_rul))
-            confidence = 0.70
-            spread = 0.30
+            candidate_rul = max_achievable_life
+            confidence = 0.85
+            spread = 0.15
             candidate_status = "NOMINAL_HEALTH"
             deg_rate = round(((100.0 - self.CRITICAL_HEALTH_THRESHOLD) / tbo_hours) * stress, 4)
             method = "Physics-Stress Weighted Trend Extrapolation"
@@ -314,8 +330,11 @@ class RULService:
                     status = candidate_status
             else:
                 # Candidate is higher than prev_rul - dt_consumed
-                # Upward movement detected! Check if supported by genuine operating stress reduction:
-                if rho_stress > 1.05:
+                if is_sensor_fault:
+                    # Isolated sensor fault: preserve genuine engine RUL without locking into transient sensor false alarm
+                    rul_h = max(0.0, min(max_achievable_life, candidate_rul))
+                    status = candidate_status
+                elif rho_stress > 1.05:
                     # Operating stress reduced (e.g. throttled down, cooler ambient, lower altitude)
                     # Allow bounded upward revision according to physical revision rule:
                     max_allowed_rul = prev_rul * min(1.20, rho_stress) - dt_consumed
@@ -414,23 +433,66 @@ class RULService:
             except (TypeError, ValueError):
                 base_health = 100.0
         else:
-            # RC-1 leakage fix: Do NOT derive base_health from
-            # Degradation_State or Degradation_Severity (ground-truth labels).
-            base_health = 100.0
+            obs_health = 100.0
+            op = telemetry.get("Oil_Pressure")
+            vib = telemetry.get("Vibration")
+            eff = telemetry.get("Efficiency")
+            if op is not None:
+                try:
+                    f_op = float(op)
+                    if f_op < 50.0:
+                        obs_health -= max(0.0, (50.0 - f_op) * 1.5)
+                except (TypeError, ValueError):
+                    pass
+            if vib is not None:
+                try:
+                    f_vib = float(vib)
+                    if f_vib > 0.8:
+                        obs_health -= max(0.0, (f_vib - 0.8) * 30.0)
+                except (TypeError, ValueError):
+                    pass
+            if eff is not None:
+                try:
+                    f_eff = float(eff)
+                    if f_eff < 0.60:
+                        obs_health -= max(0.0, (0.60 - f_eff) * 50.0)
+                except (TypeError, ValueError):
+                    pass
+            base_health = max(10.0, min(100.0, obs_health))
 
         slope = context.get("degradation_slope")
-        elapsed_hours = 0.0
-        try:
-            elapsed_hours = float(context.get("elapsed_hours", context.get("flight_hours", 0.0)))
-            if not math.isfinite(elapsed_hours) or elapsed_hours < 0:
-                elapsed_hours = 0.0
-        except (TypeError, ValueError):
-            elapsed_hours = 0.0
-        if elapsed_hours == 0.0 and "mission_time_min" in context:
+        if "elapsed_hours" in context:
             try:
-                elapsed_hours = max(0.0, float(context["mission_time_min"]) / 60.0)
+                val = float(context["elapsed_hours"])
+                elapsed_hours = max(0.0, val) if math.isfinite(val) else 0.0
             except (TypeError, ValueError):
                 elapsed_hours = 0.0
+        elif "flight_hours" in context:
+            try:
+                val = float(context["flight_hours"])
+                elapsed_hours = max(0.0, val) if math.isfinite(val) else 0.0
+            except (TypeError, ValueError):
+                elapsed_hours = 0.0
+        elif "mission_time_min" in context:
+            try:
+                val = float(context["mission_time_min"])
+                elapsed_hours = max(0.0, val / 60.0) if math.isfinite(val) else 0.0
+            except (TypeError, ValueError):
+                elapsed_hours = 0.0
+        elif "mission_hours" in context:
+            try:
+                val = float(context["mission_hours"])
+                elapsed_hours = max(0.0, val) if math.isfinite(val) else 0.0
+            except (TypeError, ValueError):
+                elapsed_hours = 0.0
+        elif "timestamp" in context:
+            try:
+                val = float(context["timestamp"])
+                elapsed_hours = max(0.0, val / 3600.0) if math.isfinite(val) else 0.0
+            except (TypeError, ValueError):
+                elapsed_hours = 0.0
+        else:
+            elapsed_hours = 0.0
 
         stress = self.calculate_mission_stress(context)
         max_achievable = max(0.0, tbo_hours - elapsed_hours * stress)

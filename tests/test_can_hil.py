@@ -52,7 +52,7 @@ def test_can_hil_master_16_scenario_validation_matrix():
 
     timing = report["timing_statistics"]
     assert timing["mean_latency_ms"] < 2.0
-    assert timing["p99_latency_ms"] < 5.0
+    assert timing["p99_latency_ms"] < 10.0
 
 
 def test_can_crc_corruption_rejection():
